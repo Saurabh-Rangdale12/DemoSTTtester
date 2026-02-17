@@ -8,7 +8,8 @@ import websockets
 import json
 import base64
 import subprocess
-from urllib.parse import urlparse # Added for better URL handling
+import traceback
+from urllib.parse import urlparse
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -35,7 +36,9 @@ PROJECT_ID = "sadproject2025"
 LOCATION = "us-central1"
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "YOUR_SARVAM_KEY")
 ORISTT_API_KEY = os.getenv("ORISTT_API_KEY", "YOUR_ORISTT_KEY")
-ORISTT_URL_HOST = os.getenv("ORISTT_URL_HOST", "example.oriserve.com") 
+
+# UPDATED: We set the new URL here as the default
+ORISTT_URL_HOST = os.getenv("ORISTT_URL_HOST", "wss://ori-asr-test.oriserve.com") 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) Abstract Interface
@@ -147,13 +150,13 @@ class SarvamAIProvider(TranscriptionProvider):
             return f"Error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) Provider 4: OriSTT (WebSocket) - Debug Version
+# 6) Provider 4: OriSTT (WebSocket) - Updated with New URL
 # ─────────────────────────────────────────────────────────────────────────────
 class OriSTTProvider(TranscriptionProvider):
     def __init__(self):
         self.api_key = ORISTT_API_KEY
         
-        # URL Construction
+        # URL Logic
         clean_host = ORISTT_URL_HOST.strip()
         if "://" not in clean_host:
             clean_host = f"wss://{clean_host}"
@@ -174,46 +177,30 @@ class OriSTTProvider(TranscriptionProvider):
         
         logger.info(f"Connecting to OriSTT at: {self.full_url}")
 
-        # 1. FFmpeg Conversion (Debug Mode)
+        # 1. FFmpeg Conversion
         try:
-            # We explicitly allow overwriting (-y) and ensure simple PCM output
             process = await asyncio.create_subprocess_exec(
-                'ffmpeg', 
-                '-y',                  # Overwrite if exists
-                '-i', audio_path,      # Input
-                '-f', 's16le',         # Format: Signed 16-bit Little Endian
-                '-acodec', 'pcm_s16le',# Codec
-                '-ar', '16000',        # Rate: 16k
-                '-ac', '1',            # Channels: Mono
-                'pipe:1',              # Output to Stdout
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE
+                'ffmpeg', '-y', '-i', audio_path, '-f', 's16le', '-acodec', 'pcm_s16le',
+                '-ar', '16000', '-ac', '1', '-v', 'quiet', 'pipe:1',
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            
             stdout, stderr = await process.communicate()
-            
             if process.returncode != 0:
-                # Capture the ACTUAL error message from FFmpeg
-                error_log = stderr.decode()
-                logger.error(f"FFmpeg Critical Error: {error_log}")
-                return f"FFmpeg Failed. details: {error_log[:200]}" # Return first 200 chars of error
-                
+                return f"FFmpeg Error: {stderr.decode()}"
             raw_data = stdout
-            logger.info(f"Audio converted successfully. Raw size: {len(raw_data)} bytes")
+            logger.info(f"Audio converted. Size: {len(raw_data)} bytes")
 
         except FileNotFoundError:
-            logger.critical("FFmpeg binary not found. Run 'sudo apt install ffmpeg'")
-            return "Error: FFmpeg is not installed on this server. Run 'sudo apt install ffmpeg'"
-        except Exception as e:
-            return f"Conversion Crash: {str(e)}"
+            return "Error: FFmpeg not installed. Run 'sudo apt install ffmpeg'"
 
         # 2. WebSocket Streaming
         transcripts = []
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         try:
-            async with websockets.connect(self.full_url, additional_headers=headers) as ws:
-                logger.info("Connected to OriSTT WebSocket")
+            # Increased timeout to 10s for initial connection
+            async with websockets.connect(self.full_url, additional_headers=headers, open_timeout=10) as ws:
+                logger.info("✅ Connected to OriSTT WebSocket")
                 
                 CHUNK_SIZE = 320 
                 offset = 0
@@ -227,12 +214,13 @@ class OriSTTProvider(TranscriptionProvider):
                         await ws.send(json.dumps(payload))
                         await asyncio.sleep(0.01) 
                     
-                    await asyncio.sleep(1.0) # Wait for final response
+                    # Wait for final processing
+                    await asyncio.sleep(1.0)
 
                 async def receiver():
                     try:
                         while True:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
                             data = json.loads(msg)
                             if data.get("status") == "recognized":
                                 text = data.get("data", "")
@@ -242,8 +230,17 @@ class OriSTTProvider(TranscriptionProvider):
 
                 await asyncio.gather(sender(), receiver())
 
+        except websockets.exceptions.InvalidStatusCode as e:
+            logger.error(f"OriSTT Auth Failed: {e.status_code}")
+            return f"Auth Error ({e.status_code}): Check API Key."
+            
+        except websockets.exceptions.ConnectionClosed as e:
+             logger.error(f"OriSTT Connection Closed: {e.code} {e.reason}")
+             return f"Server Closed Connection: {e.code} - {e.reason}"
+
         except Exception as e:
-            return f"Connection Error: {str(e)}"
+            logger.error(f"OriSTT Crash: {traceback.format_exc()}")
+            return f"Connection Failed: {repr(e)}"
 
         return " ".join(transcripts)
 
@@ -267,8 +264,8 @@ class TranscriptionAgent:
         logger.info(f"Processing file: {filename}")
 
         for provider in self.providers:
-            # logger.info(f"Running: {provider.provider_name}")
             try:
+                # logger.info(f"Running: {provider.provider_name}")
                 text = await provider.transcribe(file_path, mime_type)
                 results[provider.provider_name] = text
             except Exception as e:
