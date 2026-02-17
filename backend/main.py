@@ -2,6 +2,7 @@ import os
 import shutil
 import logging
 import mimetypes
+import requests  # <--- NEW IMPORT
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -24,9 +25,11 @@ logger = logging.getLogger("AudioAgent")
 
 app = FastAPI(title="Multi-Provider Transcription Agent")
 
-# --- FIX 1: Hardcoded Credentials to stop the "Warning" ---
+# --- CREDENTIALS ---
 PROJECT_ID = "sadproject2025"
 LOCATION = "us-central1"
+# Put your Sarvam API Key here
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "YOUR_SARVAM_API_KEY") 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) Abstract Interface
@@ -46,7 +49,6 @@ class TranscriptionProvider(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 class GoogleSTTProvider(TranscriptionProvider):
     def __init__(self):
-        # ADC: Automatically uses credentials from 'gcloud auth application-default login'
         self.client = speech.SpeechClient()
 
     @property
@@ -59,7 +61,6 @@ class GoogleSTTProvider(TranscriptionProvider):
                 content = audio_file.read()
 
             audio = speech.RecognitionAudio(content=content)
-            
             config = speech.RecognitionConfig(
                 language_code="en-US",
                 enable_automatic_punctuation=True,
@@ -79,9 +80,6 @@ class GoogleSTTProvider(TranscriptionProvider):
 # ─────────────────────────────────────────────────────────────────────────────
 class GeminiAudioProvider(TranscriptionProvider):
     def __init__(self):
-        # --- FIX 2: Added 'vertexai=True' ---
-        # The SDK requires this flag to know we are using Google Cloud (ADC)
-        # instead of an API Key.
         self.client = GenAIClient(
             vertexai=True, 
             project=PROJECT_ID, 
@@ -118,13 +116,62 @@ class GeminiAudioProvider(TranscriptionProvider):
             return f"Error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) The Agent / Orchestrator
+# 5) Provider 3: Sarvam AI (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+class SarvamAIProvider(TranscriptionProvider):
+    def __init__(self):
+        self.api_key = SARVAM_API_KEY
+        self.url = "https://api.sarvam.ai/speech-to-text"
+
+    @property
+    def provider_name(self) -> str:
+        return "Sarvam_AI"
+
+    def transcribe(self, audio_path: str, mime_type: str) -> str:
+        if not self.api_key or self.api_key == "YOUR_SARVAM_API_KEY":
+            return "Error: Sarvam API Key missing."
+
+        try:
+            logger.info("Sending to Sarvam AI...")
+            
+            headers = {
+                "api-subscription-key": self.api_key
+            }
+            
+            # Using 'saarika:v2.5' as default model
+            data = {
+                "model": "saarika:v2.5",
+                "language_code": "unknown" # Auto-detect language
+            }
+
+            # Open file and send request
+            with open(audio_path, 'rb') as f:
+                files = {
+                    'file': (os.path.basename(audio_path), f, mime_type)
+                }
+                
+                response = requests.post(self.url, headers=headers, data=data, files=files)
+
+            if response.status_code == 200:
+                result_json = response.json()
+                return result_json.get("transcript", "No transcript returned.")
+            else:
+                logger.error(f"Sarvam API Failed: {response.text}")
+                return f"Error {response.status_code}: {response.text}"
+
+        except Exception as e:
+            logger.error(f"Sarvam AI Error: {e}")
+            return f"Error: {str(e)}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) The Agent / Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 class TranscriptionAgent:
     def __init__(self):
         self.providers: List[TranscriptionProvider] = [
             GoogleSTTProvider(),
-            GeminiAudioProvider()
+            GeminiAudioProvider(),
+            SarvamAIProvider()  # <--- Registered New Provider
         ]
 
     def process_audio(self, file_path: str, filename: str) -> Dict[str, Any]:
@@ -146,7 +193,7 @@ class TranscriptionAgent:
 agent = TranscriptionAgent()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) API Endpoints
+# 7) API Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/upload-audio/")
 async def upload_audio(file: UploadFile = File(...)):
@@ -173,7 +220,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.get("/")
 def home():
-    return {"message": "Audio Agent is Running (Authenticated via GCloud CLI)"}
+    return {"message": "Audio Agent is Running (Google STT, Gemini, Sarvam AI)"}
 
 if __name__ == "__main__":
     import uvicorn
