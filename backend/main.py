@@ -2,7 +2,12 @@ import os
 import shutil
 import logging
 import mimetypes
-import requests  # <--- NEW IMPORT
+import requests
+import asyncio
+import websockets
+import json
+import base64
+import subprocess  # <--- NEW: Replaces pydub for audio conversion
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -19,7 +24,6 @@ from google.genai import types
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-# Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("AudioAgent")
 
@@ -28,8 +32,9 @@ app = FastAPI(title="Multi-Provider Transcription Agent")
 # --- CREDENTIALS ---
 PROJECT_ID = "sadproject2025"
 LOCATION = "us-central1"
-# Put your Sarvam API Key here
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "YOUR_SARVAM_API_KEY") 
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "YOUR_SARVAM_KEY")
+ORISTT_API_KEY = os.getenv("ORISTT_API_KEY", "YOUR_ORISTT_KEY")
+ORISTT_URL_HOST = os.getenv("ORISTT_URL_HOST", "example.oriserve.com") 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) Abstract Interface
@@ -45,7 +50,7 @@ class TranscriptionProvider(ABC):
         pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) Provider 1: Google Cloud Speech-to-Text (Standard STT)
+# 3) Provider 1: Google Cloud Speech-to-Text
 # ─────────────────────────────────────────────────────────────────────────────
 class GoogleSTTProvider(TranscriptionProvider):
     def __init__(self):
@@ -59,16 +64,12 @@ class GoogleSTTProvider(TranscriptionProvider):
         try:
             with open(audio_path, "rb") as audio_file:
                 content = audio_file.read()
-
             audio = speech.RecognitionAudio(content=content)
             config = speech.RecognitionConfig(
                 language_code="en-US",
                 enable_automatic_punctuation=True,
             )
-
-            logger.info("Sending to Google Cloud STT...")
             response = self.client.recognize(config=config, audio=audio)
-
             transcript = " ".join([result.alternatives[0].transcript for result in response.results])
             return transcript if transcript else "No speech detected."
         except Exception as e:
@@ -76,15 +77,11 @@ class GoogleSTTProvider(TranscriptionProvider):
             return f"Error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Provider 2: Google Gen AI (Gemini Multimodal)
+# 4) Provider 2: Google Gemini
 # ─────────────────────────────────────────────────────────────────────────────
 class GeminiAudioProvider(TranscriptionProvider):
     def __init__(self):
-        self.client = GenAIClient(
-            vertexai=True, 
-            project=PROJECT_ID, 
-            location=LOCATION
-        )
+        self.client = GenAIClient(vertexai=True, project=PROJECT_ID, location=LOCATION)
         self.model_name = "gemini-2.0-flash-001" 
 
     @property
@@ -95,16 +92,13 @@ class GeminiAudioProvider(TranscriptionProvider):
         try:
             with open(audio_path, "rb") as f:
                 audio_bytes = f.read()
-            
-            logger.info(f"Sending to Gemini 2.0 ({mime_type})...")
-            
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=[
                     types.Content(
                         role="user",
                         parts=[
-                            types.Part.from_text(text="Please transcribe this audio file exactly as spoken."),
+                            types.Part.from_text(text="Transcribe this audio."),
                             types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
                         ]
                     )
@@ -116,7 +110,7 @@ class GeminiAudioProvider(TranscriptionProvider):
             return f"Error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) Provider 3: Sarvam AI (NEW)
+# 5) Provider 3: Sarvam AI
 # ─────────────────────────────────────────────────────────────────────────────
 class SarvamAIProvider(TranscriptionProvider):
     def __init__(self):
@@ -128,63 +122,130 @@ class SarvamAIProvider(TranscriptionProvider):
         return "Sarvam_AI"
 
     def transcribe(self, audio_path: str, mime_type: str) -> str:
-        if not self.api_key or self.api_key == "YOUR_SARVAM_API_KEY":
-            return "Error: Sarvam API Key missing."
-
+        if not self.api_key or "YOUR" in self.api_key: return "Error: API Key missing."
         try:
-            logger.info("Sending to Sarvam AI...")
-            
-            headers = {
-                "api-subscription-key": self.api_key
-            }
-            
-            # Using 'saarika:v2.5' as default model
-            data = {
-                "model": "saarika:v2.5",
-                "language_code": "unknown" # Auto-detect language
-            }
-
-            # Open file and send request
+            headers = {"api-subscription-key": self.api_key}
+            data = {"model": "saarika:v2.5", "language_code": "unknown"}
             with open(audio_path, 'rb') as f:
-                files = {
-                    'file': (os.path.basename(audio_path), f, mime_type)
-                }
-                
+                files = {'file': (os.path.basename(audio_path), f, mime_type)}
                 response = requests.post(self.url, headers=headers, data=data, files=files)
-
             if response.status_code == 200:
-                result_json = response.json()
-                return result_json.get("transcript", "No transcript returned.")
-            else:
-                logger.error(f"Sarvam API Failed: {response.text}")
-                return f"Error {response.status_code}: {response.text}"
-
+                return response.json().get("transcript", "No text.")
+            return f"Error {response.status_code}: {response.text}"
         except Exception as e:
-            logger.error(f"Sarvam AI Error: {e}")
+            logger.error(f"Sarvam Error: {e}")
             return f"Error: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) The Agent / Orchestrator
+# 6) Provider 4: OriSTT (WebSocket Streaming) -- UPDATED NO PYDUB
+# ─────────────────────────────────────────────────────────────────────────────
+class OriSTTProvider(TranscriptionProvider):
+    def __init__(self):
+        self.api_key = ORISTT_API_KEY
+        self.host = ORISTT_URL_HOST.replace("wss://", "").replace("/", "")
+        self.full_url = f"wss://{self.host}/connect?model=ori-prime-v2.3&sample_rate=16000&language=en"
+
+    @property
+    def provider_name(self) -> str:
+        return "OriSTT_WebSocket"
+
+    async def _stream_audio(self, audio_path: str):
+        transcripts = []
+        
+        # --- NEW: Convert Audio to PCM 16kHz Mono using subprocess (ffmpeg) ---
+        # This removes the dependency on pydub/audioop
+        try:
+            command = [
+                'ffmpeg', 
+                '-i', audio_path,       # Input file
+                '-f', 's16le',          # Output format: Signed 16-bit Little Endian
+                '-acodec', 'pcm_s16le', # Codec
+                '-ar', '16000',         # Sample rate: 16kHz
+                '-ac', '1',             # Channels: Mono
+                '-v', 'quiet',          # Suppress logs
+                'pipe:1'                # Output to stdout
+            ]
+            
+            # Run the command and capture output bytes
+            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            if process.returncode != 0:
+                logger.error(f"FFmpeg Error: {process.stderr.decode()}")
+                return f"FFmpeg Conversion Failed. Is ffmpeg installed?"
+                
+            raw_data = process.stdout
+            
+        except FileNotFoundError:
+            return "Error: FFmpeg is not installed on the system."
+        except Exception as e:
+            return f"Error processing audio: {e}"
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        try:
+            async with websockets.connect(self.full_url, additional_headers=headers) as ws:
+                logger.info("Connected to OriSTT WebSocket")
+                
+                CHUNK_SIZE = 320 # 10ms for 16kHz
+                offset = 0
+                
+                async def sender():
+                    nonlocal offset
+                    while offset < len(raw_data):
+                        chunk = raw_data[offset : offset + CHUNK_SIZE]
+                        offset += CHUNK_SIZE
+                        payload = {"audio": base64.b64encode(chunk).decode("utf-8")}
+                        await ws.send(json.dumps(payload))
+                        await asyncio.sleep(0.01)
+                    await asyncio.sleep(1)
+
+                async def receiver():
+                    try:
+                        while True:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                            data = json.loads(msg)
+                            if data.get("status") == "recognized":
+                                text = data.get("data", "")
+                                if text: transcripts.append(text)
+                    except asyncio.TimeoutError: pass
+                    except Exception: pass
+
+                await asyncio.gather(sender(), receiver())
+
+        except Exception as e:
+            logger.error(f"OriSTT Connection failed: {e}")
+            return f"Connection Error: {str(e)}"
+
+        return " ".join(transcripts)
+
+    def transcribe(self, audio_path: str, mime_type: str) -> str:
+        if not self.api_key or "YOUR" in self.api_key: return "Error: OriSTT API Key missing."
+        try:
+            return asyncio.run(self._stream_audio(audio_path))
+        except Exception as e:
+            return f"Runtime Error: {str(e)}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) The Agent
 # ─────────────────────────────────────────────────────────────────────────────
 class TranscriptionAgent:
     def __init__(self):
         self.providers: List[TranscriptionProvider] = [
             GoogleSTTProvider(),
             GeminiAudioProvider(),
-            SarvamAIProvider()  # <--- Registered New Provider
+            SarvamAIProvider(),
+            OriSTTProvider()
         ]
 
     def process_audio(self, file_path: str, filename: str) -> Dict[str, Any]:
         results = {}
-        
         mime_type, _ = mimetypes.guess_type(filename)
-        if not mime_type:
-            mime_type = "audio/mpeg" 
-            
-        logger.info(f"Processing file: {filename} detected as {mime_type}")
+        if not mime_type: mime_type = "audio/mpeg"
+        
+        logger.info(f"Processing file: {filename} ({mime_type})")
 
         for provider in self.providers:
-            logger.info(f"Running provider: {provider.provider_name}")
+            logger.info(f"Running: {provider.provider_name}")
             text = provider.transcribe(file_path, mime_type)
             results[provider.provider_name] = text
             
@@ -193,34 +254,22 @@ class TranscriptionAgent:
 agent = TranscriptionAgent()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7) API Endpoints
+# 8) Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/upload-audio/")
 async def upload_audio(file: UploadFile = File(...)):
     temp_filename = f"temp_{file.filename}"
-    
     try:
         with open(temp_filename, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
         transcription_results = agent.process_audio(temp_filename, file.filename)
         
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-        return JSONResponse(content={
-            "filename": file.filename,
-            "transcriptions": transcription_results
-        })
-
+        if os.path.exists(temp_filename): os.remove(temp_filename)
+        return JSONResponse(content={"filename": file.filename, "transcriptions": transcription_results})
     except Exception as e:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+        if os.path.exists(temp_filename): os.remove(temp_filename)
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-def home():
-    return {"message": "Audio Agent is Running (Google STT, Gemini, Sarvam AI)"}
 
 if __name__ == "__main__":
     import uvicorn
