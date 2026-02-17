@@ -1,0 +1,6 @@
+GOOGLE_CLOUD_PROJECT=projectid
+GOOGLE_CLOUD_LOCATION=us-central1
+SARVAM_API_KEY=sk_ww-------------------w77jX
+
+ORISTT_API_KEY=Ss28-------------------3W
+ORISTT_URL_HOST=wss://ori-----------.com
