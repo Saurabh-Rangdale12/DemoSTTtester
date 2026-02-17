@@ -18,3 +18,6 @@ build/
 /.env
 /frontend/.env
 /backend/.env
+
+/.env
+*.env
